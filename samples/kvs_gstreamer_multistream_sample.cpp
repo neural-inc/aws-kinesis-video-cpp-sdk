@@ -23,6 +23,8 @@ struct CameraConfig {
     std::string codec;
 };
 
+LOGGER_TAG("com.amazonaws.kinesis.video.gstreamer");
+
 // Simple JSON parser for cameras.json
 std::vector<CameraConfig> parseCamerasJson(const std::string& filename) {
     std::vector<CameraConfig> cameras;
@@ -83,8 +85,6 @@ int gstreamer_init(int, char **);
 #ifdef __cplusplus
 }
 #endif
-
-LOGGER_TAG("com.amazonaws.kinesis.video.gstreamer");
 
 /*
  * https://stackoverflow.com/questions/417142/what-is-the-maximum-length-of-a-url-in-different-browsers
