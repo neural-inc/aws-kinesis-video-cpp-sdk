@@ -51,7 +51,9 @@ typedef struct _CustomData {
             synthetic_dts(0),
             last_unpersisted_file_idx(0),
             put_fragment_metadata_frequency_seconds(5),
+            deliver_images_frequency_seconds(5),
             fragment_metadata_timer_id(0),
+            deliver_images_timer_id(0),
             stream_status(STATUS_SUCCESS),
             base_pts(0),
             max_frame_pts(0),
@@ -71,7 +73,9 @@ typedef struct _CustomData {
     char *stream_name;
     mutex file_list_mtx;
     int put_fragment_metadata_frequency_seconds;
+    int deliver_images_frequency_seconds;
     int fragment_metadata_timer_id;
+    int deliver_images_timer_id;
     int metadata_counter = 0;
     bool persist_flag = true;
 
@@ -249,6 +253,16 @@ void sigint_handler(int sigint){
     data_global.stream_status = STATUS_KVS_GSTREAMER_SAMPLE_INTERRUPTED;
 }
 
+
+bool put_event_metadata(GstElement* element, const uint32_t metadataEvent, const PStreamEventMetadata pStreamEventMetadata) {
+  GstStructure *metadata = gst_structure_new_empty(KVS_ADD_EVENT_METADATA_G_STRUCT_NAME);
+  gst_structure_set(metadata, KVS_ADD_EVENT_METADATA_EVENT, G_TYPE_UINT, metadataEvent, 
+                  KVS_ADD_EVENT_METADATA_STREAM_EVENT_METADATA, G_TYPE_POINTER, pStreamEventMetadata, NULL);
+  GstEvent* event = gst_event_new_custom(GST_EVENT_CUSTOM_DOWNSTREAM, metadata);
+  LOG_TRACE("Emit the images to be delivered event with structure: " << std::string(gst_structure_to_string (metadata)));
+  return gst_element_send_event(element, event);
+}
+
 /*
 This function creates a GstStructure and uses it to trigger the GST_EVENT_CUSTOM_DOWNSTREAM for put_fragment_metadata
 */
@@ -261,6 +275,21 @@ bool put_fragment_metadata(GstElement* element, const std::string name, const st
   LOG_INFO("Emit the put_fragment_metadata event with structure: " << std::string(gst_structure_to_string (metadata)));
   return gst_element_send_event(element, event);
 }
+
+
+/*
+Function to deliver images by calling put_event_metadata. Customers can write their own "deliver_images" or other similar function
+to put event metadata. Currently this function is being called every five seconds using a timer. This logic can be modified
+and the trigger for this function can also be customized by the customer
+*/
+static void deliver_images(GstElement* element) {
+    if (!put_event_metadata(element, STREAM_EVENT_TYPE_IMAGE_GENERATION, NULL)) {
+        g_source_remove(data_global.deliver_images_timer_id);
+        data_global.deliver_images_timer_id = 0;
+        LOG_WARN("Failed to deliver image, removing timer");
+    }
+}
+
 
 /*
 Function to put fragment metadata: name, value, and persist values
@@ -290,8 +319,8 @@ static void put_metadata(GstElement* element) {
     ++data_global.metadata_counter;
     data_global.persist_flag = !data_global.persist_flag;
 
-    metadata_name_stream << STREAM_EVENT_TYPE_IMAGE_GENERATION;
-    metadata_value_stream << "";
+    metadata_name_stream << "NEURAL NETWATCH";
+    metadata_value_stream << "SUPER SPRAWA";
 
     // All even metadata_value_n are persistent, all odd ones are non-persistent. 
     if (data_global.metadata_counter == 2 * MAX_FRAGMENT_METADATA_COUNT) {
@@ -816,6 +845,7 @@ int gstreamer_init(int argc, char *argv[], CustomData *data) {
 
     // Create a GStreamer timer to generate and put fragment metadata tags every 2 seconds
     data->fragment_metadata_timer_id = g_timeout_add_seconds(data->put_fragment_metadata_frequency_seconds, reinterpret_cast<GSourceFunc>(put_metadata), kvssink);
+    data->deliver_images_timer_id = g_timeout_add_seconds(data->deliver_images_frequency_seconds, reinterpret_cast<GSourceFunc>(deliver_images), kvssink);
 
     /* start streaming */
     gst_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);

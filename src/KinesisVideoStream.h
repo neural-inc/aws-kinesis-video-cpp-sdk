@@ -84,17 +84,17 @@ public:
     bool putFragmentMetadata(const std::string& name, const std::string& value, bool persistent = true);
 
     /**
-     * Appends an MKV associated with an event
-     *
-     * NOTE: the MKV is added after each fragment cluster.
-     * This is a limitation of MKV format as Tags are level 1 elements.
-     * Instead, they will be accumulated and inserted in-between the fragments and at the end of the stream.
-     * @param 1 event - enum value from enum STREAM_EVENT_TYPE. These are bit flags and can be bitwise OR'd
-     * to send multiple.
-     * @param 2 pStreamEventMetadata - optional param to include custom metadata. Limited to 5 name/value pairs.
-     *
+     * Inserts a KVS event(s) accompanied by optional metadata (key/value string pairs) into the stream.
+     * Multiple events can be submitted at once by using bitwise OR of event types, or multiple calls of this
+     * function with different unique events.
+     * @param 1 uint32_t - the type of event(s), a value from STREAM_EVENT_TYPE enum.
+     *                   if you want to submit multiple events in one call it is suggested to use bit-wise
+     *                   OR combination from STREAM_EVENT_TYPE enum.
+     * @param 2 PStreamEventMetadata - pointer to struct with optional metadata. This metadata will be applied
+     *                                 to all events included in THIS function call.
      */
-    bool putEventMetadata(uint32_t event, PStreamEventMetadata pStreamEventMetadata = NULL);
+    bool putEventMetadata(uint32_t event, PStreamEventMetadata pStreamEventMetadata);
+
     /**
      * Initializes the track identified by trackId with a hex-encoded codec private data
      * and puts the stream in a state that it is ready to receive frames via putFrame().
