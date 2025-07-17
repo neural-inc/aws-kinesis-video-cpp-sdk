@@ -23,6 +23,49 @@ struct CameraConfig {
     std::string codec;
 };
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int gstreamer_init(int, char **);
+
+#ifdef __cplusplus
+}
+#endif
+
+/*
+ * https://stackoverflow.com/questions/417142/what-is-the-maximum-length-of-a-url-in-different-browsers
+ */
+#define MAX_URL_LENGTH 65536
+#define DEFAULT_RETENTION_PERIOD_HOURS 2
+#define DEFAULT_KMS_KEY_ID ""
+#define DEFAULT_STREAMING_TYPE STREAMING_TYPE_REALTIME
+#define DEFAULT_CONTENT_TYPE "video/h264"
+#define DEFAULT_MAX_LATENCY_SECONDS 60
+#define DEFAULT_FRAGMENT_DURATION_MILLISECONDS 2000
+#define DEFAULT_TIMECODE_SCALE_MILLISECONDS 1
+#define DEFAULT_KEY_FRAME_FRAGMENTATION TRUE
+#define DEFAULT_FRAME_TIMECODES TRUE
+#define DEFAULT_ABSOLUTE_FRAGMENT_TIMES TRUE
+#define DEFAULT_FRAGMENT_ACKS TRUE
+#define DEFAULT_RESTART_ON_ERROR TRUE
+#define DEFAULT_RECALCULATE_METRICS TRUE
+#define DEFAULT_STREAM_FRAMERATE 25
+#define DEFAULT_AVG_BANDWIDTH_BPS (4 * 1024 * 1024)
+#define DEFAULT_BUFFER_DURATION_SECONDS 120
+#define DEFAULT_REPLAY_DURATION_SECONDS 40
+#define DEFAULT_CONNECTION_STALENESS_SECONDS 60
+#define DEFAULT_CODEC_ID "V_MPEG4/ISO/AVC"
+#define DEFAULT_TRACKNAME "kinesis_video"
+#define APP_SINK_BASE_NAME "appsink"
+#define DEFAULT_BUFFER_SIZE (1 * 1024 * 1024)
+#define DEFAULT_STORAGE_SIZE (128 * 1024 * 1024)
+#define DEFAULT_ROTATION_TIME_SECONDS 3600
+#define ACCESS_KEY_ENV_VAR "ACCESS_KEY_ENV_VAR"
+#define SECRET_KEY_ENV_VAR "SECRET_KEY_ENV_VAR"
+#define DEFAULT_REGION_ENV_VAR "DEFAULT_REGION_ENV_VAR"
+#define DEFAULT_AWS_REGION "eu-central-1"
+
 LOGGER_TAG("com.amazonaws.kinesis.video.gstreamer");
 
 // Simple JSON parser for cameras.json
@@ -75,45 +118,6 @@ std::vector<CameraConfig> parseCamerasJson(const std::string& filename) {
     file.close();
     return cameras;
 }
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int gstreamer_init(int, char **);
-
-#ifdef __cplusplus
-}
-#endif
-
-/*
- * https://stackoverflow.com/questions/417142/what-is-the-maximum-length-of-a-url-in-different-browsers
- */
-#define MAX_URL_LENGTH 65536
-#define DEFAULT_RETENTION_PERIOD_HOURS 2
-#define DEFAULT_KMS_KEY_ID ""
-#define DEFAULT_STREAMING_TYPE STREAMING_TYPE_REALTIME
-#define DEFAULT_CONTENT_TYPE "video/h264"
-#define DEFAULT_MAX_LATENCY_SECONDS 60
-#define DEFAULT_FRAGMENT_DURATION_MILLISECONDS 2000
-#define DEFAULT_TIMECODE_SCALE_MILLISECONDS 1
-#define DEFAULT_KEY_FRAME_FRAGMENTATION TRUE
-#define DEFAULT_FRAME_TIMECODES TRUE
-#define DEFAULT_ABSOLUTE_FRAGMENT_TIMES TRUE
-#define DEFAULT_FRAGMENT_ACKS TRUE
-#define DEFAULT_RESTART_ON_ERROR TRUE
-#define DEFAULT_RECALCULATE_METRICS TRUE
-#define DEFAULT_STREAM_FRAMERATE 25
-#define DEFAULT_AVG_BANDWIDTH_BPS (4 * 1024 * 1024)
-#define DEFAULT_BUFFER_DURATION_SECONDS 120
-#define DEFAULT_REPLAY_DURATION_SECONDS 40
-#define DEFAULT_CONNECTION_STALENESS_SECONDS 60
-#define DEFAULT_CODEC_ID "V_MPEG4/ISO/AVC"
-#define DEFAULT_TRACKNAME "kinesis_video"
-#define APP_SINK_BASE_NAME "appsink"
-#define DEFAULT_BUFFER_SIZE (1 * 1024 * 1024)
-#define DEFAULT_STORAGE_SIZE (128 * 1024 * 1024)
-#define DEFAULT_ROTATION_TIME_SECONDS 3600
 
 namespace com { namespace amazonaws { namespace kinesis { namespace video {
 
@@ -512,9 +516,9 @@ int gstreamer_init(int argc, char *argv[]) {
         const CameraConfig& camera = cameras[i];
         // Use camera name from JSON, replacing spaces and special characters with underscores
         string stream_name = camera.name;
-        std::replace(stream_name.begin(), stream_name.end(), ' ', '_');
-        std::replace(stream_name.begin(), stream_name.end(), '.', '_');
-        std::replace(stream_name.begin(), stream_name.end(), '-', '_');
+        // std::replace(stream_name.begin(), stream_name.end(), ' ', '_');
+        // std::replace(stream_name.begin(), stream_name.end(), '.', '_');
+        // std::replace(stream_name.begin(), stream_name.end(), '–', '-');
         
         string appsink_name = base_appsink_name + std::to_string(i);
         
@@ -526,45 +530,50 @@ int gstreamer_init(int argc, char *argv[]) {
         data.camera_configs[appsink_name] = camera;
         data.last_metadata_time[appsink_name] = 0;  // Initialize to 0 for immediate first metadata
         
-        GstElement *appsink, *depay, *source, *filter, *pipeline;
+        GstElement *appsink, *depay, *parser, *source, *filter, *pipeline;
 
         appsink = gst_element_factory_make("appsink", appsink_name.c_str());
         
-        // Select appropriate depayloader based on codec
+        // Select appropriate depayloader and parser based on codec
         if (camera.codec == "h264") {
             depay = gst_element_factory_make("rtph264depay", "depay");
+            parser = gst_element_factory_make("h264parse", "parser");
         } else if (camera.codec == "h265") {
             depay = gst_element_factory_make("rtph265depay", "depay");
+            parser = gst_element_factory_make("h265parse", "parser");
+            // Set config-interval to -1 for h265parse
+            g_object_set(G_OBJECT(parser), "config-interval", -1, NULL);
         } else {
             LOG_ERROR("Unsupported codec: " << camera.codec << " for camera: " << camera.name);
             continue;
         }
         source = gst_element_factory_make("rtspsrc", "source");
-        filter = gst_element_factory_make("capsfilter", "encoder_filter");
+        // filter = gst_element_factory_make("capsfilter", "encoder_filter");
         
-        // Set caps based on codec
-        GstCaps *caps;
-        if (camera.codec == "h264") {
-            caps = gst_caps_new_simple("video/x-h264",
-                                     "stream-format", G_TYPE_STRING, "avc",
-                                     "alignment", G_TYPE_STRING, "au",
-                                     NULL);
-        } else { // h265
-            caps = gst_caps_new_simple("video/x-h265",
-                                     "stream-format", G_TYPE_STRING, "hvc1",
-                                     "alignment", G_TYPE_STRING, "au",
-                                     NULL);
-        }
+        // // Set caps based on codec
+        // GstCaps *caps;
+        // if (camera.codec == "h264") {
+        //     caps = gst_caps_new_simple("video/x-h264",
+        //                              "stream-format", G_TYPE_STRING, "avc",
+        //                              "alignment", G_TYPE_STRING, "au",
+        //                              NULL);
+        // } else { // h265
+        //     caps = gst_caps_new_simple("video/x-h265",
+        //                              "stream-format", G_TYPE_STRING, "hvc1",
+        //                              "alignment", G_TYPE_STRING, "au",
+        //                              NULL);
+        // }
         
-        g_object_set(G_OBJECT (filter), "caps", caps, NULL);
-        gst_caps_unref(caps);
+        // g_object_set(G_OBJECT (filter), "caps", caps, NULL);
+        // gst_caps_unref(caps);
         pipeline = gst_pipeline_new("rtsp-kinesis-pipeline");
 
-        if (!pipeline || !source || !depay  || !appsink) {
+        if (!pipeline || !source || !depay || !parser || !appsink) {
             g_printerr("Not all elements could be created for camera %s:\n", camera.name.c_str());
             if (!pipeline) g_printerr("\tCore pipeline\n");
             if (!source) g_printerr("\trtspsrc (gst-plugins-good)\n");
             if (!depay) g_printerr("\trtph264depay/rtph265depay (gst-plugins-good)\n");
+            if (!parser) g_printerr("\th264parse/h265parse (gst-plugins-bad)\n");
             if (!appsink) g_printerr("\tappsink (gst-plugins-base)\n");
             continue;
         }
@@ -584,11 +593,11 @@ int gstreamer_init(int argc, char *argv[]) {
 
         /* build the pipeline */
         gst_bin_add_many(GST_BIN (pipeline), source,
-                         depay, filter, appsink,
+                         depay, parser, appsink,
                          NULL);
 
         /* Leave the actual source out - this will be done when the pad is added */
-        if (!gst_element_link_many(depay, filter,
+        if (!gst_element_link_many(depay, parser,
                                    appsink,
                                    NULL)) {
 
