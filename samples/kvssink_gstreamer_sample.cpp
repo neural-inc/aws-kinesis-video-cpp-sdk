@@ -50,6 +50,8 @@ typedef struct _CustomData {
             h264_stream_supported(false),
             synthetic_dts(0),
             last_unpersisted_file_idx(0),
+            put_fragment_metadata_frequency_seconds(5),
+            fragment_metadata_timer_id(0),
             stream_status(STATUS_SUCCESS),
             base_pts(0),
             max_frame_pts(0),
@@ -68,6 +70,10 @@ typedef struct _CustomData {
     bool h264_stream_supported;
     char *stream_name;
     mutex file_list_mtx;
+    int put_fragment_metadata_frequency_seconds;
+    int fragment_metadata_timer_id;
+    int metadata_counter = 0;
+    bool persist_flag = true;
 
     // list of files to upload.
     vector<FileInfo> file_list;
@@ -158,6 +164,11 @@ static bool resolution_supported(GstCaps *src_caps, GstCaps *query_caps_raw, Gst
 
 /* callback when eos (End of Stream) is posted on bus */
 static void eos_cb(GstElement *sink, GstMessage *message, CustomData *data) {
+    if (data->fragment_metadata_timer_id != 0) {
+        g_source_remove(data->fragment_metadata_timer_id);
+        data->fragment_metadata_timer_id = 0;
+        LOG_TRACE("Removing the put_metadata timer");
+    }
     if (data->streamSource == FILE_SOURCE) {
         // bookkeeping base_pts. add 1ms to avoid overlap.
         data->base_pts += +data->max_frame_pts + duration_cast<nanoseconds>(milliseconds(1)).count();
@@ -177,6 +188,12 @@ static void eos_cb(GstElement *sink, GstMessage *message, CustomData *data) {
 static void error_cb(GstBus *bus, GstMessage *msg, CustomData *data) {
     GError *err;
     gchar *debug_info;
+
+    if (data->fragment_metadata_timer_id != 0) {
+        g_source_remove(data->fragment_metadata_timer_id);
+        data->fragment_metadata_timer_id = 0;
+        LOG_TRACE("Removing the put_metadata timer");
+    }
 
     /* Print error details on the screen */
     gst_message_parse_error(msg, &err, &debug_info);
@@ -218,7 +235,13 @@ void timer(CustomData *data) {
 
 /* Function handles sigint signal */
 void sigint_handler(int sigint){
-    LOG_DEBUG("SIGINT received.  Exiting graceully");
+    LOG_DEBUG("SIGINT received.  Exiting gracefully");
+
+    if (data_global.fragment_metadata_timer_id != 0) {
+        g_source_remove(data_global.fragment_metadata_timer_id);
+        data_global.fragment_metadata_timer_id = 0;
+        LOG_TRACE("Removing the put_metadata timer");
+    }
     
     if(data_global.main_loop != NULL){
         g_main_loop_quit(data_global.main_loop);
@@ -226,39 +249,112 @@ void sigint_handler(int sigint){
     data_global.stream_status = STATUS_KVS_GSTREAMER_SAMPLE_INTERRUPTED;
 }
 
-void determine_credentials(GstElement *kvssink, CustomData *data) {
+/*
+This function creates a GstStructure and uses it to trigger the GST_EVENT_CUSTOM_DOWNSTREAM for put_fragment_metadata
+*/
+bool put_fragment_metadata(GstElement* element, const std::string name, const std::string value, bool persistent) {
+  GstStructure *metadata = gst_structure_new_empty(KVS_ADD_METADATA_G_STRUCT_NAME);
+  gst_structure_set(metadata, KVS_ADD_METADATA_NAME, G_TYPE_STRING, name.c_str(), 
+                  KVS_ADD_METADATA_VALUE, G_TYPE_STRING, value.c_str(), 
+                  KVS_ADD_METADATA_PERSISTENT, G_TYPE_BOOLEAN, persistent, NULL);
+  GstEvent* event = gst_event_new_custom(GST_EVENT_CUSTOM_DOWNSTREAM, metadata);
+  LOG_INFO("Emit the put_fragment_metadata event with structure: " << std::string(gst_structure_to_string (metadata)));
+  return gst_element_send_event(element, event);
+}
 
-    char const *iot_credential_endpoint;
-    char const *cert_path;
-    char const *private_key_path;
-    char const *role_alias;
-    char const *ca_cert_path;
-    char const *credential_path;
-    if (nullptr != (iot_credential_endpoint = getenv("IOT_GET_CREDENTIAL_ENDPOINT")) &&
-        nullptr != (cert_path = getenv("CERT_PATH")) &&
-        nullptr != (private_key_path = getenv("PRIVATE_KEY_PATH")) &&
-        nullptr != (role_alias = getenv("ROLE_ALIAS")) &&
-        nullptr != (ca_cert_path = getenv("CA_CERT_PATH"))) {
-	// set the IoT Credentials if provided in envvar
-	GstStructure *iot_credentials =  gst_structure_new(
-			"iot-certificate",
-			"iot-thing-name", G_TYPE_STRING, data->stream_name, 
-			"endpoint", G_TYPE_STRING, iot_credential_endpoint,
-			"cert-path", G_TYPE_STRING, cert_path,
-			"key-path", G_TYPE_STRING, private_key_path,
-			"ca-path", G_TYPE_STRING, ca_cert_path,
-			"role-aliases", G_TYPE_STRING, role_alias, NULL);
-	
-	g_object_set(G_OBJECT (kvssink), "iot-certificate", iot_credentials, NULL);
-        gst_structure_free(iot_credentials);
-    // kvssink will search for long term credentials in envvar automatically so no need to include here
-    // if no long credentials or IoT credentials provided will look for credential file as last resort
-    } else if(nullptr != (credential_path = getenv("AWS_CREDENTIAL_PATH"))){
-        g_object_set(G_OBJECT (kvssink), "credential-path", credential_path, NULL);
+/*
+Function to put fragment metadata: name, value, and persist values
+This is a sample function. This function alternates between putting persistent and non-persistent metadata
+until it puts maximum number (10) of metadata in a fragment. After that, it removes the timer that fires this function
+
+Customers can write their own put_metadata and trigger it either using the timer or some other logic. This function can contain custom logic to
+generate the metadata. To trigger the downstream event that calls the API putKinesisVideoFragmentMetadata,
+put_fragment_metadata must be called as shown below.
+Example:
+    <metadata_name, metadata_value, is_persistent>
+    "metadata_name_1", "metadata_value_1", 0
+    "metadata_name_2", "metadata_value_2", 1
+    "metadata_name_3", "metadata_value_3", 0
+    "metadata_name_4", "metadata_value_4", 1
+    "metadata_name_1", "metadata_value_5", 0
+    "metadata_name_2", "metadata_value_6", 1
+    "metadata_name_3", "metadata_value_7", 0
+    "metadata_name_4", "metadata_value_8", 1
+
+To remove a persistent metadata entry, call the same function with empty value
+    "metadata_name_2", "", 1
+*/ 
+static void put_metadata(GstElement* element) {
+    std::ostringstream metadata_name_stream, metadata_value_stream;
+
+    ++data_global.metadata_counter;
+    data_global.persist_flag = !data_global.persist_flag;
+
+    metadata_name_stream << STREAM_EVENT_TYPE_IMAGE_GENERATION;
+    metadata_value_stream << "";
+
+    // All even metadata_value_n are persistent, all odd ones are non-persistent. 
+    if (data_global.metadata_counter == 2 * MAX_FRAGMENT_METADATA_COUNT) {
+        if (data_global.fragment_metadata_timer_id != 0) {
+            g_source_remove(data_global.fragment_metadata_timer_id);
+            data_global.fragment_metadata_timer_id = 0;
+            LOG_WARN("Removing the put_metadata timer as the the max capacity for metadata in a fragment is reached");
+        }
+    }
+
+    if (!put_fragment_metadata(element, metadata_name_stream.str(), metadata_value_stream.str(), false)) {
+        LOG_WARN("Failed to put fragment metadata with name:" << metadata_name_stream.str() << " and value:" << metadata_value_stream.str());
+    } else {
+        LOG_INFO("Put fragment metadata with name:" << metadata_name_stream.str() << " and value:" << metadata_value_stream.str());
     }
 }
 
-int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElement *pipeline) {
+void determine_credentials(GstElement *kvssink, CustomData *data) {
+
+    // char const *iot_credential_endpoint;
+    // char const *cert_path;
+    // char const *private_key_path;
+    // char const *role_alias;
+    // char const *ca_cert_path;
+    // char const *credential_path;
+    // if (nullptr != (iot_credential_endpoint = getenv("IOT_GET_CREDENTIAL_ENDPOINT")) &&
+    //     nullptr != (cert_path = getenv("CERT_PATH")) &&
+    //     nullptr != (private_key_path = getenv("PRIVATE_KEY_PATH")) &&
+    //     nullptr != (role_alias = getenv("ROLE_ALIAS")) &&
+    //     nullptr != (ca_cert_path = getenv("CA_CERT_PATH"))) {
+	// // set the IoT Credentials if provided in envvar
+	// GstStructure *iot_credentials =  gst_structure_new(
+	// 		"iot-certificate",
+	// 		"iot-thing-name", G_TYPE_STRING, data->stream_name, 
+	// 		"endpoint", G_TYPE_STRING, iot_credential_endpoint,
+	// 		"cert-path", G_TYPE_STRING, cert_path,
+	// 		"key-path", G_TYPE_STRING, private_key_path,
+	// 		"ca-path", G_TYPE_STRING, ca_cert_path,
+	// 		"role-aliases", G_TYPE_STRING, role_alias, NULL);
+	
+	// g_object_set(G_OBJECT (kvssink), "iot-certificate", iot_credentials, NULL);
+    //     gst_structure_free(iot_credentials);
+    // // kvssink will search for long term credentials in envvar automatically so no need to include here
+    // // if no long credentials or IoT credentials provided will look for credential file as last resort
+    
+    char const *accessKey;
+    char const *secretKey;
+    char const *defaultRegion;
+
+    if(nullptr != (accessKey = getenv("ACCESS_KEY_ENV_VAR"))){
+        g_object_set(G_OBJECT (kvssink), "access-key", accessKey, NULL);
+    }
+    if(nullptr != (secretKey = getenv("SECRET_KEY_ENV_VAR"))){
+        g_object_set(G_OBJECT (kvssink), "secret-key", secretKey, NULL);
+    }
+    if(nullptr != (defaultRegion = getenv("DEFAULT_REGION_ENV_VAR"))){
+        g_object_set(G_OBJECT (kvssink), "aws-region", defaultRegion, NULL);
+    }
+
+
+}
+
+int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElement *pipeline, GstElement *kvssink) {
 
     bool vtenc = false, isOnRpi = false;
 
@@ -331,7 +427,7 @@ int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElem
     LOG_DEBUG("Streaming with live source and width: " << width << ", height: " << height << ", fps: " << framerate
                                                        << ", bitrateInKBPS" << bitrateInKBPS);
 
-    GstElement *source_filter, *filter, *kvssink, *h264parse, *encoder, *source, *video_convert;
+    GstElement *source_filter, *filter, *h264parse, *encoder, *source, *video_convert;
 
     /* create the elemnents */
     source_filter = gst_element_factory_make("capsfilter", "source_filter");
@@ -344,11 +440,6 @@ int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElem
         LOG_ERROR("Failed to create capsfilter (2)");
         return 1;
     }
-    kvssink = gst_element_factory_make("kvssink", "kvssink");
-    if (!kvssink) {
-        LOG_ERROR("Failed to create kvssink");
-        return 1;
-    }
     h264parse = gst_element_factory_make("h264parse", "h264parse"); // needed to enforce avc stream format
     if (!h264parse) {
         LOG_ERROR("Failed to create h264parse");
@@ -356,7 +447,7 @@ int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElem
     }
 
     // Attempt to create vtenc encoder
-    encoder = gst_element_factory_make("vtenc_h264_hw", "encoder");
+    encoder = gst_element_factory_make("vtenc_h265_hw", "encoder");
     if (encoder) {
         vtenc = true;
         source = gst_element_factory_make("videotestsrc", "source");
@@ -368,18 +459,18 @@ int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElem
         }
     } else {
         // Failed creating vtenc - check pi hardware encoder
-        encoder = gst_element_factory_make("omxh264enc", "encoder");
+        encoder = gst_element_factory_make("omxh265enc", "encoder");
         if (encoder) {
-            LOG_DEBUG("Using omxh264enc")
+            LOG_DEBUG("Using omxh265enc")
             isOnRpi = true;
         } else {
             // - attempt x264enc
             isOnRpi = false;
-            encoder = gst_element_factory_make("x264enc", "encoder");
+            encoder = gst_element_factory_make("x265enc", "encoder");
             if (encoder) {
-                LOG_DEBUG("Using x264enc");
+                LOG_DEBUG("Using x265enc");
             } else {
-                LOG_ERROR("Failed to create x264enc");
+                LOG_ERROR("Failed to create x265enc");
                 return 1;
             }
         }
@@ -411,7 +502,7 @@ int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElem
         g_object_set(G_OBJECT(source), "do-timestamp", TRUE, "device", "/dev/video0", NULL);
     }
 
-    /* Determine whether device supports h264 encoding and select a streaming resolution supported by the device*/
+    /* Determine whether device supports h265 encoding and select a streaming resolution supported by the device*/
     if (GST_STATE_CHANGE_FAILURE == gst_element_set_state(source, GST_STATE_READY)) {
         g_printerr("Unable to set the source to ready state.\n");
         return 1;
@@ -425,7 +516,7 @@ int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElem
                                                   "width", G_TYPE_INT, width,
                                                   "height", G_TYPE_INT, height,
                                                   NULL);
-    GstCaps *query_caps_h264 = gst_caps_new_simple("video/x-h264",
+    GstCaps *query_caps_h264 = gst_caps_new_simple("video/x-h265",
                                                    "width", G_TYPE_INT, width,
                                                    "height", G_TYPE_INT, height,
                                                    NULL);
@@ -504,17 +595,17 @@ int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElem
     }
 
 
-    /* configure filter */
-    GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
-                                             "stream-format", G_TYPE_STRING, "avc",
-                                             "alignment", G_TYPE_STRING, "au",
-                                             NULL);
-    if (!data->h264_stream_supported) {
-        gst_caps_set_simple(h264_caps, "profile", G_TYPE_STRING, "baseline",
-                            NULL);
-    }
-    g_object_set(G_OBJECT(filter), "caps", h264_caps, NULL);
-    gst_caps_unref(h264_caps);
+    // /* configure filter */
+    // GstCaps *h264_caps = gst_caps_new_simple("video/x-h265",
+    //                                          "stream-format", G_TYPE_STRING, "avc",
+    //                                          "alignment", G_TYPE_STRING, "au",
+    //                                          NULL);
+    // if (!data->h264_stream_supported) {
+    //     gst_caps_set_simple(h264_caps, "profile", G_TYPE_STRING, "baseline",
+    //                         NULL);
+    // }
+    // g_object_set(G_OBJECT(filter), "caps", h264_caps, NULL);
+    // gst_caps_unref(h264_caps);
 
     /* configure kvssink */
     g_object_set(G_OBJECT(kvssink), "stream-name", data->stream_name, "storage-size", 128, NULL);
@@ -543,7 +634,7 @@ int gstreamer_live_source_init(int argc, char *argv[], CustomData *data, GstElem
     return 0;
 }
 
-int gstreamer_rtsp_source_init(int argc, char *argv[], CustomData *data, GstElement *pipeline) {
+int gstreamer_rtsp_source_init(int argc, char *argv[], CustomData *data, GstElement *pipeline, GstElement *kvssink) {
     // process runtime if provided
     if (argc == 5){
       if ((0 == STRCMPI(argv[3], "-runtime")) ||
@@ -555,26 +646,25 @@ int gstreamer_rtsp_source_init(int argc, char *argv[], CustomData *data, GstElem
 	  }
       }
     }
-    GstElement *filter, *kvssink, *depay, *source, *h264parse;
+    GstElement *filter, *depay, *source, *h264parse;
 
     filter = gst_element_factory_make("capsfilter", "filter");
-    kvssink = gst_element_factory_make("kvssink", "kvssink");
-    depay = gst_element_factory_make("rtph264depay", "depay");
+    depay = gst_element_factory_make("rtph265depay", "depay");
     source = gst_element_factory_make("rtspsrc", "source");
-    h264parse = gst_element_factory_make("h264parse", "h264parse");
+    h264parse = gst_element_factory_make("h265parse", "h265parse");
 
-    if (!pipeline || !source || !depay || !kvssink || !filter || !h264parse) {
+    if (!pipeline || !source || !depay || !filter || !h264parse) {
         g_printerr("Not all elements could be created.\n");
         return 1;
     }
 
     // configure filter
-    GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
-                                             "stream-format", G_TYPE_STRING, "avc",
-                                             "alignment", G_TYPE_STRING, "au",
-                                             NULL);
-    g_object_set(G_OBJECT(filter), "caps", h264_caps, NULL);
-    gst_caps_unref(h264_caps);
+    // GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
+    //                                          "stream-format", G_TYPE_STRING, "avc",
+    //                                          "alignment", G_TYPE_STRING, "au",
+    //                                          NULL);
+    // g_object_set(G_OBJECT(filter), "caps", h264_caps, NULL);
+    // gst_caps_unref(h264_caps);
 
     // configure kvssink
     g_object_set(G_OBJECT(kvssink), "stream-name", data->stream_name, "storage-size", 128, NULL);
@@ -606,16 +696,15 @@ int gstreamer_rtsp_source_init(int argc, char *argv[], CustomData *data, GstElem
     return 0;
 }
 
-int gstreamer_file_source_init(CustomData *data, GstElement *pipeline) {
+int gstreamer_file_source_init(CustomData *data, GstElement *pipeline, GstElement *kvssink) {
 
-    GstElement *demux, *kvssink, *filesrc, *h264parse, *filter, *queue;
+    GstElement *demux, *filesrc, *h264parse, *filter, *queue;
     string file_suffix;
     string file_path = data->file_list.at(data->current_file_idx).path;
 
     filter = gst_element_factory_make("capsfilter", "filter");
-    kvssink = gst_element_factory_make("kvssink", "kvssink");
     filesrc = gst_element_factory_make("filesrc", "filesrc");
-    h264parse = gst_element_factory_make("h264parse", "h264parse");
+    h264parse = gst_element_factory_make("h265parse", "h265parse");
     queue = gst_element_factory_make("queue", "queue");
 
     // set demux based off filetype
@@ -683,28 +772,34 @@ int gstreamer_init(int argc, char *argv[], CustomData *data) {
     /* init GStreamer */
     gst_init(&argc, &argv);
 
-    GstElement *pipeline;
+    GstElement *pipeline, *kvssink;
     int ret;
     GstStateChangeReturn gst_ret;
 
     // Reset first frame pts
     data->first_pts = GST_CLOCK_TIME_NONE;
 
+    kvssink = gst_element_factory_make("kvssink", "kvssink");
+    if (!kvssink) {
+        LOG_ERROR("Failed to create kvssink");
+        return 1;
+    }
+
     switch (data->streamSource) {
         case LIVE_SOURCE:
             LOG_INFO("Streaming from live source");
             pipeline = gst_pipeline_new("live-kinesis-pipeline");
-            ret = gstreamer_live_source_init(argc, argv, data, pipeline);
+            ret = gstreamer_live_source_init(argc, argv, data, pipeline, kvssink);
             break;
         case RTSP_SOURCE:
             LOG_INFO("Streaming from rtsp source");
             pipeline = gst_pipeline_new("rtsp-kinesis-pipeline");
-            ret = gstreamer_rtsp_source_init(argc, argv, data, pipeline);
+            ret = gstreamer_rtsp_source_init(argc, argv, data, pipeline, kvssink);
             break;
         case FILE_SOURCE:
             LOG_INFO("Streaming from file source");
             pipeline = gst_pipeline_new("file-kinesis-pipeline");
-            ret = gstreamer_file_source_init(data, pipeline);
+            ret = gstreamer_file_source_init(data, pipeline, kvssink);
             break;
     }
 
@@ -718,12 +813,16 @@ int gstreamer_init(int argc, char *argv[], CustomData *data) {
     g_signal_connect(G_OBJECT(bus), "message::error", (GCallback) error_cb, data);
     g_signal_connect(G_OBJECT(bus), "message::eos", G_CALLBACK(eos_cb), data);
     gst_object_unref(bus);
+
+    // Create a GStreamer timer to generate and put fragment metadata tags every 2 seconds
+    data->fragment_metadata_timer_id = g_timeout_add_seconds(data->put_fragment_metadata_frequency_seconds, reinterpret_cast<GSourceFunc>(put_metadata), kvssink);
+
     /* start streaming */
     gst_ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (gst_ret == GST_STATE_CHANGE_FAILURE) {
         g_printerr("Unable to set the pipeline to the playing state.\n");
         gst_object_unref(pipeline);
-	data->stream_status = STATUS_KVS_GSTREAMER_SAMPLE_ERROR; 
+	    data->stream_status = STATUS_KVS_GSTREAMER_SAMPLE_ERROR; 
         return 1;
     }
     // set timer if valid runtime provided (non-positive values are ignored)
@@ -831,7 +930,7 @@ int main(int argc, char *argv[]) {
                     } else if(stream_status == STATUS_KVS_GSTREAMER_SAMPLE_INTERRUPTED){
 		        LOG_ERROR("File upload interrupted.  Terminating.");
 		        continue_uploading = false;
-		    }else { // non fatal case.  retry upload
+		    } else { // non fatal case.  retry upload
                         LOG_ERROR("stream error occurred: " << stream_status << ". Terminating.");
                         do_retry = true;
                     }

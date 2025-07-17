@@ -538,11 +538,15 @@ int gstreamer_init(int argc, char *argv[]) {
         if (camera.codec == "h264") {
             depay = gst_element_factory_make("rtph264depay", "depay");
             parser = gst_element_factory_make("h264parse", "parser");
+            // For h264parse, config-interval is in frames, not seconds
+            // Set to send SPS/PPS with every keyframe
+            g_object_set(G_OBJECT(parser), "config-interval", 1, NULL);
         } else if (camera.codec == "h265") {
             depay = gst_element_factory_make("rtph265depay", "depay");
             parser = gst_element_factory_make("h265parse", "parser");
-            // Set config-interval to -1 for h265parse
-            g_object_set(G_OBJECT(parser), "config-interval", -1, NULL);
+            // For h265parse, config-interval is in seconds
+            // Set to -1 to send VPS/SPS/PPS with every IDR frame
+            g_object_set(G_OBJECT(parser), "config-interval", 1, NULL);
         } else {
             LOG_ERROR("Unsupported codec: " << camera.codec << " for camera: " << camera.name);
             continue;
